@@ -99,6 +99,8 @@ class LlamaAdapterConfig(PretrainedConfig):
         bos_token_id=1,
         eos_token_id=2,
         tie_word_embeddings=False,
+        add_bias=False,
+        add_scale=False,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -113,6 +115,8 @@ class LlamaAdapterConfig(PretrainedConfig):
         self.use_cache = use_cache
         self.num_prefix_layers = num_prefix_layers
         self.num_prefix_tokens = num_prefix_tokens
+        self.add_bais=add_bias
+        self.add_scale=add_scale
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,

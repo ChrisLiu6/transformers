@@ -71,6 +71,24 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
     return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
 
 
+class ScaleBiasLinear(nn.Linear):
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, scale=False):
+        super(ScaleBiasLinear, self).__init__(in_features, out_features, bias)
+        if self.bias is not None:
+            self.bias.data.zero_()
+
+        if scale:
+            self.scale = nn.Parameter(torch.ones(in_features))
+        else:
+            self.register_parameter('scale', None)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        if self.scale is not None:
+            input = input * self.scale
+        output = super(ScaleBiasLinear, self).forward(input)
+        return output
+
+
 # Copied from transformers.models.llama.modeling_llama.LlamaRMSNorm with Llama->LlamaAdapter
 class LlamaAdapterRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -140,22 +158,24 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
     return q_embed, k_embed
 
 
-# Copied from transformers.models.llama.modeling_llama.LlamaMLP with Llama->LlamaAdapter
 class LlamaAdapterMLP(nn.Module):
     def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        hidden_act: str,
-    ):
+        self, config: LlamaAdapterConfig):
         super().__init__()
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
-        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        hidden_size = config.hidden_size
+        intermediate_size = config.intermediate_size
+        hidden_act = config.hidden_act
+        add_bias = config.add_bais
+        add_scale = config.add_scale
+
+        self.gate_proj =ScaleBiasLinear(hidden_size, intermediate_size, bias=add_bias, scale=add_scale)
+        self.down_proj =ScaleBiasLinear(intermediate_size, hidden_size, bias=add_bias, scale=add_scale)
+        self.up_proj =ScaleBiasLinear(hidden_size, intermediate_size, bias=add_bias, scale=add_scale)
         self.act_fn = ACT2FN[hidden_act]
 
     def forward(self, x):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
 
 
 class LlamaAdapterAttention(nn.Module):
@@ -174,10 +194,10 @@ class LlamaAdapterAttention(nn.Module):
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_heads})."
             )
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        self.q_proj = ScaleBiasLinear(self.hidden_size, self.num_heads * self.head_dim, bias=config.add_bais, scale=config.add_scale)
+        self.k_proj = ScaleBiasLinear(self.hidden_size, self.num_heads * self.head_dim, bias=config.add_bais, scale=config.add_scale)
+        self.v_proj = ScaleBiasLinear(self.hidden_size, self.num_heads * self.head_dim, bias=config.add_bais, scale=config.add_scale)
+        self.o_proj = ScaleBiasLinear(self.num_heads * self.head_dim, self.hidden_size, bias=config.add_bais, scale=config.add_scale)
         self.rotary_emb = LlamaAdapterRotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings)
 
         self.layer_idx = layer_idx
@@ -292,11 +312,7 @@ class LlamaAdapterDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = LlamaAdapterAttention(config=config, layer_idx=layer_idx)
-        self.mlp = LlamaAdapterMLP(
-            hidden_size=self.hidden_size,
-            intermediate_size=config.intermediate_size,
-            hidden_act=config.hidden_act,
-        )
+        self.mlp = LlamaAdapterMLP(config)
         self.input_layernorm = LlamaAdapterRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaAdapterRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
