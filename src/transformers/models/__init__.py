@@ -107,6 +107,7 @@ from . import (
     levit,
     lilt,
     llama,
+    llama_adapter,
     longformer,
     longt5,
     luke,
