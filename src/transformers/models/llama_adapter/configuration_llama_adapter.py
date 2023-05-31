@@ -93,14 +93,20 @@ class LlamaAdapterConfig(PretrainedConfig):
         initializer_range=0.02,
         rms_norm_eps=1e-6,
         use_cache=True,
-        num_prefix_layers=30,
-        num_prefix_tokens=10,
         pad_token_id=0,
         bos_token_id=1,
         eos_token_id=2,
         tie_word_embeddings=False,
+        num_prefix_layers=31,
+        num_prefix_tokens=10,
         add_bias=False,
         add_scale=False,
+        lora_rank=0,
+        clip_dim=768,
+        v_embed_dim=768,
+        v_depth=8,
+        v_num_heads=16,
+        v_mlp_ratio=4.0,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -117,6 +123,15 @@ class LlamaAdapterConfig(PretrainedConfig):
         self.num_prefix_tokens = num_prefix_tokens
         self.add_bais=add_bias
         self.add_scale=add_scale
+        self.lora_rank=lora_rank
+        # multi-modal
+        self.clip_dim = clip_dim
+        self.v_embed_dim = v_embed_dim
+        self.v_depth = v_depth
+        self.v_num_heads=v_num_heads,
+        self.v_mlp_ratio=v_mlp_ratio,
+
+
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,

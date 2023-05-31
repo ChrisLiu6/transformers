@@ -26,6 +26,8 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
+from timm.models.vision_transformer import Block
+
 from ...activations import ACT2FN
 from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast
 from ...modeling_utils import PreTrainedModel
@@ -71,10 +73,10 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
     return inverted_mask.masked_fill(inverted_mask.to(torch.bool), torch.finfo(dtype).min)
 
 
-class ScaleBiasLinear(nn.Linear):
-    def __init__(self, in_features: int, out_features: int, bias: bool = True, scale=False):
-        super(ScaleBiasLinear, self).__init__(in_features, out_features, bias)
-        if self.bias is not None:
+class ScaleBiasLoraLinear(nn.Linear):
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, scale=False, lora_rank=0):
+        super(ScaleBiasLoraLinear, self).__init__(in_features, out_features, bias)
+        if bias:
             self.bias.data.zero_()
 
         if scale:
@@ -82,10 +84,20 @@ class ScaleBiasLinear(nn.Linear):
         else:
             self.register_parameter('scale', None)
 
+        if lora_rank>0:
+            self.lora_w1 = nn.Parameter(torch.Tensor(lora_rank, in_features))
+            self.lora_w2 = nn.Parameter(torch.zeros(out_features, lora_rank))
+        else:
+            self.register_parameter('lora_w1', None)
+            self.register_parameter('lora_w2', None)
+
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         if self.scale is not None:
             input = input * self.scale
-        output = super(ScaleBiasLinear, self).forward(input)
+
+        output = super(ScaleBiasLoraLinear, self).forward(input)
+        if self.lora_w1 is not None:
+            output = output + self.lora_w2 @ (self.lora_w1 @ input)
         return output
 
 
@@ -167,10 +179,11 @@ class LlamaAdapterMLP(nn.Module):
         hidden_act = config.hidden_act
         add_bias = config.add_bais
         add_scale = config.add_scale
+        lora_rank = config.lora_rank
 
-        self.gate_proj =ScaleBiasLinear(hidden_size, intermediate_size, bias=add_bias, scale=add_scale)
-        self.down_proj =ScaleBiasLinear(intermediate_size, hidden_size, bias=add_bias, scale=add_scale)
-        self.up_proj =ScaleBiasLinear(hidden_size, intermediate_size, bias=add_bias, scale=add_scale)
+        self.gate_proj =ScaleBiasLoraLinear(hidden_size, intermediate_size, bias=add_bias, scale=add_scale, lora_rank=lora_rank)
+        self.down_proj =ScaleBiasLoraLinear(intermediate_size, hidden_size, bias=add_bias, scale=add_scale, lora_rank=lora_rank)
+        self.up_proj =ScaleBiasLoraLinear(hidden_size, intermediate_size, bias=add_bias, scale=add_scale, lora_rank=lora_rank)
         self.act_fn = ACT2FN[hidden_act]
 
     def forward(self, x):
@@ -194,24 +207,21 @@ class LlamaAdapterAttention(nn.Module):
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_heads})."
             )
-        self.q_proj = ScaleBiasLinear(self.hidden_size, self.num_heads * self.head_dim, bias=config.add_bais, scale=config.add_scale)
-        self.k_proj = ScaleBiasLinear(self.hidden_size, self.num_heads * self.head_dim, bias=config.add_bais, scale=config.add_scale)
-        self.v_proj = ScaleBiasLinear(self.hidden_size, self.num_heads * self.head_dim, bias=config.add_bais, scale=config.add_scale)
-        self.o_proj = ScaleBiasLinear(self.num_heads * self.head_dim, self.hidden_size, bias=config.add_bais, scale=config.add_scale)
+        self.q_proj = ScaleBiasLoraLinear(self.hidden_size, self.num_heads * self.head_dim, bias=config.add_bais, scale=config.add_scale, lora_rank=config.lora_rank)
+        self.k_proj = ScaleBiasLoraLinear(self.hidden_size, self.num_heads * self.head_dim, bias=config.add_bais, scale=config.add_scale, lora_rank=config.lora_rank)
+        self.v_proj = ScaleBiasLoraLinear(self.hidden_size, self.num_heads * self.head_dim, bias=config.add_bais, scale=config.add_scale, lora_rank=config.lora_rank)
+        self.o_proj = ScaleBiasLoraLinear(self.num_heads * self.head_dim, self.hidden_size, bias=config.add_bais, scale=config.add_scale, lora_rank=config.lora_rank)
         self.rotary_emb = LlamaAdapterRotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings)
 
         self.layer_idx = layer_idx
         if layer_idx >= config.num_hidden_layers - config.num_prefix_layers:
-            self.prefix = nn.Parameter(torch.Tensor(1, config.num_prefix_tokens, self.hidden_size))
-            nn.init.normal_(self.prefix)
+            # self.prefix = nn.Parameter(torch.Tensor(1, config.num_prefix_tokens, self.hidden_size))
+            # nn.init.normal_(self.prefix)
             self.gate = nn.Parameter(torch.zeros(1,self.num_heads,1,1))
-            self.prefix_len = config.num_prefix_tokens
+            # self.prefix_len = config.num_prefix_tokens
         else:
-            self.prefix = None
+            # self.prefix = None
             self.gate = None
-
-        self.cache_prefix_k = None
-        self.cache_prefix_v = None
 
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
@@ -220,6 +230,7 @@ class LlamaAdapterAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        prefix: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
@@ -268,19 +279,9 @@ class LlamaAdapterAttention(nn.Module):
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_output = torch.matmul(attn_weights, value_states)
 
-        if self.prefix is not None:
-            if self.training or self.cache_prefix_k is None:
-                prefix_k = self.k_proj(self.prefix).view(1, self.prefix_len, self.num_heads, self.head_dim).transpose(1, 2)
-                prefix_v = self.v_proj(self.prefix).view(1, self.prefix_len, self.num_heads, self.head_dim).transpose(1, 2)
-                if self.training:
-                    self.cache_prefix_k = None
-                    self.cache_prefix_v =None
-                else:
-                    self.cache_prefix_k = prefix_k.clone().data
-                    self.cache_prefix_v = prefix_v.clone().data
-            else:
-                prefix_k = self.cache_prefix_k
-                prefix_v = self.cache_prefix_v
+        if prefix is not None:
+            prefix_k = self.k_proj(prefix).view(1, self.prefix_len, self.num_heads, self.head_dim).transpose(1, 2)
+            prefix_v = self.v_proj(prefix).view(1, self.prefix_len, self.num_heads, self.head_dim).transpose(1, 2)
 
             prefix_k = prefix_k.repeat(bsz, 1, 1, 1)
             prefix_v = prefix_v.repeat(bsz, 1, 1, 1)
@@ -319,6 +320,7 @@ class LlamaAdapterDecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        prefix: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
@@ -346,6 +348,7 @@ class LlamaAdapterDecoderLayer(nn.Module):
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
+            prefix=prefix,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
@@ -501,9 +504,30 @@ class LlamaAdapterModel(LlamaAdapterPreTrainedModel):
         self.layers = nn.ModuleList([LlamaAdapterDecoderLayer(config, _) for _ in range(config.num_hidden_layers)])
         self.norm = LlamaAdapterRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        self.adaptation_prefix = nn.Parameter(torch.Tensor(config.num_prefix_layers, config.num_prefix_tokens, self.hidden_size))
+        nn.init.normal_(self.adaptation_prefix)
+        self.prefix_start_layer = config.num_hidden_layers - config.num_prefix_layers
+
+
+        if config.clip_dim > 0:
+            self.multi_modal = True
+            # CLIP model not registered as an attribute for easy extension to other feature extractor
+            self.clip_proj = nn.Linear(config.clip_dim, config.v_embed_dim)
+            self.clip_proj_norm = nn.LayerNorm(config.v_embed_dim)
+
+            self.vision_prefix = nn.Parameter(torch.Tensor(1, config.num_prefix_tokens, self.hidden_size))
+            nn.init.normal_(self.vision_prefix)
+
+            self.visual_blocks = nn.ModuleList([
+                Block(config.v_embed_dim, config.v_num_heads, config.v_mlp_ratio, qkv_bias=True)
+                for _ in range(config.v_depth)])
+            self.visual_proj = nn.Linear(config.v_embed_dim, config.hidden_size)
+            self.visual_proj_norm = nn.LayerNorm(config.hidden_size)
+
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
         self.post_init()
+
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -546,6 +570,7 @@ class LlamaAdapterModel(LlamaAdapterPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        clip_feats = None
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -601,6 +626,20 @@ class LlamaAdapterModel(LlamaAdapterPreTrainedModel):
                 )
                 use_cache = False
 
+        # todo prefix cache mechanism
+        # multi-modal
+        if self.multi_modal:
+            clip_feats = self.clip_proj_norm(self.clip_proj(clip_feats))
+
+            vision_prefix = self.vision_prefix.repeat(len(clip_feats), 1, 1)
+            vision_prefix = torch.cat([vision_prefix, clip_feats], dim=1)
+            for block in self.visual_blocks:
+                vision_prefix = block(vision_prefix)
+
+            vision_prefix = vision_prefix[:, :self.cinfig.num_prefix_tokens, :]
+            vision_prefix = self.visual_proj(vision_prefix)
+            vision_prefix = self.visual_proj_norm(vision_prefix)
+
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
@@ -609,6 +648,12 @@ class LlamaAdapterModel(LlamaAdapterPreTrainedModel):
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
+
+            prefix = None
+            if idx >= self.prefix_start_layer:
+                prefix = self.adaptation_prefix[idx-self.prefix_start_layer].unsqueeze(0)
+                if self.multi_modal:
+                    prefix = prefix + vision_prefix
 
             past_key_value = past_key_values[idx] if past_key_values is not None else None
 
@@ -623,6 +668,7 @@ class LlamaAdapterModel(LlamaAdapterPreTrainedModel):
 
                 layer_outputs = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(decoder_layer),
+                    prefix,
                     hidden_states,
                     attention_mask,
                     position_ids,
@@ -631,6 +677,7 @@ class LlamaAdapterModel(LlamaAdapterPreTrainedModel):
             else:
                 layer_outputs = decoder_layer(
                     hidden_states,
+                    prefix=prefix,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     past_key_value=past_key_value,

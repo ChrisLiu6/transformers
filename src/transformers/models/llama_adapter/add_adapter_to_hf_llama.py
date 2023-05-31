@@ -69,27 +69,86 @@ def write_json(text, path):
     with open(path, "w") as f:
         json.dump(text, f)
 
-
 def write_model(target_path, ori_path, tmp_path, adapter_path, model_size):
+    # load adapter checkpoint for parameters and configurations
+    print("Loading adapter params")
+    adapter_params = torch.load(adapter_path)
+    if "model" in adapter_params:
+        adapter_params = adapter_params['model']
+
+    # Tunable bias and scale in LLaMA-Adapter V2
+    add_bias = False
+    add_scale = False
+    tune_norm = False
+    if any(["wq_scale" in _ for _ in adapter_params.keys()]):
+        add_bias = True
+    if any(["wq_bias" in _ for _ in adapter_params.keys()]):
+        add_bias = True
+    if any(["_norm.weight" in _ for _ in adapter_params.keys()]):
+        tune_norm = True
+        
+    # prefix for adaptation
+    num_prefix_layers = 0
+    num_prefix_tokens = 0
+    if any(["attention.gate" in _ for _ in adapter_params.keys()]):
+        num_prefix_layers = sum(["attention.gate" in _ for _ in adapter_params.keys()])
+        assert "adapter_query.weight" in adapter_params
+        num_prefix_tokens = int(adapter_params['adapter_query.weight'].shape[0]/num_prefix_layers)
+
+
     shutil.copytree(ori_path, tmp_path)
 
     model_config = read_json(os.path.join(tmp_path, "config.json"))
-    model_config['num_prefix_layers'] = 30 # todo hardcode
-    model_config['num_prefix_tokens'] = 10
+    model_config['num_prefix_layers'] = num_prefix_layers
+    model_config['num_prefix_tokens'] = num_prefix_tokens
+    model_config['add_bias'] = add_bias
+    model_config['add_scale'] = add_scale
     model_config['architectures'] = ["LlamaAdapterForCausalLM"]
+    model_config["model_type"] = "llama-adapter"
+
     write_json(model_config, os.path.join(tmp_path, "config.json"))
 
-    print("Loading the checkpoint into a LlamaAdapter model.")
+    print("Loading original LLAMA checkpoint into a LlamaAdapter model.")
     model = LlamaAdapterForCausalLM.from_pretrained(tmp_path, torch_dtype=torch.float16, low_cpu_mem_usage=True)
 
     print("Loading adapter params into the LlamaAdapter model")
-    adapter_params = torch.load(adapter_path)
-    prefix_weight = adapter_params['adapter_query.weight'].reshape(model.config.num_prefix_layers, model.config.num_prefix_tokens, model.config.hidden_size)
+    if num_prefix_layers != 0:
+        prefix_weight = adapter_params['adapter_query.weight'].reshape(num_prefix_layers,
+                                                                       num_prefix_tokens,
+                                                                       model.config.hidden_size)
     state_dict = {}
     prefix_start_layer = model.config.num_hidden_layers - model.config.num_prefix_layers
     for layer_i in range(prefix_start_layer, model.config.num_hidden_layers):
         state_dict[f"model.layers.{layer_i}.self_attn.gate"] = adapter_params[f"layers.{layer_i}.attention.gate"]
         state_dict[f"model.layers.{layer_i}.self_attn.prefix"] = prefix_weight[layer_i-prefix_start_layer:layer_i-prefix_start_layer+1]
+
+
+    # for _bias
+    def bias_permute(w):
+        n_heads = model.config.num_attention_heads
+        dim = model.config.hidden_size
+        return w.view(n_heads, dim // n_heads // 2, 2).transpose(1, 2).reshape(-1)
+    for layer_i in range(model_config.num_hidden_layers):
+        if add_bias:
+            state_dict[f"model.layers.{layer_i}.self_attn.q_proj.bias"] = bias_permute(adapter_params[f"layers.{layer_i}.attention.wq_bias"])
+            state_dict[f"model.layers.{layer_i}.self_attn.k_proj.bias"] = bias_permute(adapter_params[f"layers.{layer_i}.attention.wk_bias"])
+            state_dict[f"model.layers.{layer_i}.self_attn.v_proj.bias"] = adapter_params[f"layers.{layer_i}.attention.wv_bias"]
+            state_dict[f"model.layers.{layer_i}.self_attn.o_proj.bias"] = adapter_params[f"layers.{layer_i}.attention.wo_bias"]
+            state_dict[f"model.layers.{layer_i}.mlp.gate_proj.bias"] = adapter_params[f"layers.{layer_i}.feed_forward.w1_bias"]
+            state_dict[f"model.layers.{layer_i}.mlp.down_proj.bias"] = adapter_params[f"layers.{layer_i}.feed_forward.w2_bias"]
+            state_dict[f"model.layers.{layer_i}.mlp.up_proj.bias"] = adapter_params[f"layers.{layer_i}.feed_forward.w3_bias"]
+        if add_scale:
+            state_dict[f"model.layers.{layer_i}.self_attn.q_proj.scale"] = adapter_params[f"layers.{layer_i}.attention.wq_scale"]
+            state_dict[f"model.layers.{layer_i}.self_attn.k_proj.scale"] = adapter_params[f"layers.{layer_i}.attention.wk_scale"]
+            state_dict[f"model.layers.{layer_i}.self_attn.v_proj.scale"] = adapter_params[f"layers.{layer_i}.attention.wv_scale"]
+            state_dict[f"model.layers.{layer_i}.self_attn.o_proj.scale"] = adapter_params[f"layers.{layer_i}.attention.wo_scale"]
+            state_dict[f"model.layers.{layer_i}.mlp.gate_proj.scale"] = adapter_params[f"layers.{layer_i}.feed_forward.w1_scale"]
+            state_dict[f"model.layers.{layer_i}.mlp.down_proj.scale"] = adapter_params[f"layers.{layer_i}.feed_forward.w2_scale"]
+            state_dict[f"model.layers.{layer_i}.mlp.up_proj.scale"] = adapter_params[f"layers.{layer_i}.feed_forward.w3_scale"]
+        if tune_norm:
+            state_dict[f"model.layers.{layer_i}.input_layernorm.weight"] = adapter_params[f"layers.{layer_i}.attention_norm.weight"]
+            state_dict[f"model.layers.{layer_i}.post_attention_layernorm.weight"] = adapter_params[f"layers.{layer_i}.ffn_norm.weight"]
+
     model.load_state_dict(state_dict, strict=False)
 
     # Avoid saving this as part of the config.
